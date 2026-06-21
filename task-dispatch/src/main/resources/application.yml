@@ -24,3 +24,7 @@ spring:
 traffic-monitor:
   service:
     url: http://localhost:8082
+
+task-dispatch:
+  node:
+    max-concurrent: 5

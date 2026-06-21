@@ -2,10 +2,12 @@ package com.cy3.taskdispatch.service;
 
 import com.cy3.common.entity.CrawlTask;
 import com.cy3.common.entity.CrawlerNode;
+import com.cy3.taskdispatch.queue.NodeConcurrencyManager;
+import com.cy3.taskdispatch.queue.TaskDispatchQueue;
 import com.cy3.taskdispatch.repository.CrawlTaskRepository;
 import com.cy3.taskdispatch.repository.CrawlerNodeRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -15,18 +17,33 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 
-@Slf4j
 @Service
-@RequiredArgsConstructor
 public class TaskDispatchService {
+
+    private static final Logger log = LoggerFactory.getLogger(TaskDispatchService.class);
 
     private final CrawlTaskRepository taskRepository;
     private final CrawlerNodeRepository nodeRepository;
     private final TrafficMonitorClient trafficMonitorClient;
+    private final TaskDispatchQueue taskQueue;
+    private final NodeConcurrencyManager nodeConcurrencyManager;
 
+    public TaskDispatchService(CrawlTaskRepository taskRepository,
+                               CrawlerNodeRepository nodeRepository,
+                               TrafficMonitorClient trafficMonitorClient,
+                               TaskDispatchQueue taskQueue,
+                               NodeConcurrencyManager nodeConcurrencyManager) {
+        this.taskRepository = taskRepository;
+        this.nodeRepository = nodeRepository;
+        this.trafficMonitorClient = trafficMonitorClient;
+        this.taskQueue = taskQueue;
+        this.nodeConcurrencyManager = nodeConcurrencyManager;
+    }
+
+    @Transactional
     public CrawlTask createTask(String targetUrl, String taskName, Integer priority, Long estimatedSizeKb) {
         CrawlTask task = new CrawlTask();
         task.setTaskCode("TASK-" + UUID.randomUUID().toString().replace("-", "").substring(0, 16).toUpperCase());
@@ -37,7 +54,10 @@ public class TaskDispatchService {
         task.setEstimatedSizeKb(estimatedSizeKb);
         task.setRetryCount(0);
         task.setMaxRetry(3);
-        return taskRepository.save(task);
+
+        CrawlTask saved = taskRepository.save(task);
+        taskQueue.offer(saved);
+        return saved;
     }
 
     public CrawlTask getTaskByCode(String taskCode) {
@@ -59,13 +79,6 @@ public class TaskDispatchService {
 
     @Transactional
     public CrawlTask dispatchTask(String taskCode, String nodeCode) {
-        CrawlTask task = taskRepository.findByTaskCode(taskCode)
-                .orElseThrow(() -> new IllegalArgumentException("任务不存在: " + taskCode));
-
-        if (task.getStatus() != CrawlTask.TaskStatus.PENDING.getCode()) {
-            throw new IllegalStateException("任务状态不允许分发，当前状态: " + task.getStatus());
-        }
-
         CrawlerNode node = nodeRepository.findByNodeCode(nodeCode)
                 .orElseThrow(() -> new IllegalArgumentException("节点不存在: " + nodeCode));
 
@@ -77,12 +90,30 @@ public class TaskDispatchService {
             throw new IllegalStateException("节点今日流量已超限，无法分配新任务");
         }
 
-        task.setAssignedNodeCode(nodeCode);
-        task.setStatus(CrawlTask.TaskStatus.ASSIGNED.getCode());
-        task.setAssignTime(LocalDateTime.now());
+        if (!nodeConcurrencyManager.canAcceptTask(nodeCode)) {
+            throw new IllegalStateException("节点并发任务数已达上限");
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        int updatedRows = taskRepository.assignTaskAtomically(
+                taskCode,
+                CrawlTask.TaskStatus.PENDING.getCode(),
+                CrawlTask.TaskStatus.ASSIGNED.getCode(),
+                nodeCode,
+                now,
+                now
+        );
+
+        if (updatedRows == 0) {
+            throw new IllegalStateException("任务状态已变更，分发失败（可能已被其他节点抢走）");
+        }
+
+        nodeConcurrencyManager.incrementTaskCount(nodeCode);
+        taskQueue.remove(taskCode);
+        taskQueue.incrementDispatched();
 
         log.info("任务 [{}] 已分配给节点 [{}]", taskCode, nodeCode);
-        return taskRepository.save(task);
+        return taskRepository.findByTaskCode(taskCode).orElse(null);
     }
 
     @Transactional
@@ -93,6 +124,10 @@ public class TaskDispatchService {
         }
 
         CrawlerNode bestNode = selectBestNode(availableNodes);
+        if (bestNode == null) {
+            throw new IllegalStateException("所有可用节点今日流量均已超限或并发已满");
+        }
+
         return dispatchTask(taskCode, bestNode.getNodeCode());
     }
 
@@ -101,21 +136,67 @@ public class TaskDispatchService {
         long minTraffic = Long.MAX_VALUE;
 
         for (CrawlerNode node : nodes) {
-            if (!trafficMonitorClient.isNodeAvailable(node.getNodeCode())) {
+            String nodeCode = node.getNodeCode();
+
+            if (!trafficMonitorClient.isNodeAvailable(nodeCode)) {
                 continue;
             }
-            long usedTraffic = trafficMonitorClient.getTodayUsedTraffic(node.getNodeCode());
+
+            if (!nodeConcurrencyManager.canAcceptTask(nodeCode)) {
+                continue;
+            }
+
+            long usedTraffic = trafficMonitorClient.getTodayUsedTraffic(nodeCode);
             if (usedTraffic < minTraffic) {
                 minTraffic = usedTraffic;
                 bestNode = node;
             }
         }
 
-        if (bestNode == null) {
-            throw new IllegalStateException("所有可用节点今日流量均已超限");
+        return bestNode;
+    }
+
+    public CrawlTask pullTask(String nodeCode) {
+        CrawlerNode node = nodeRepository.findByNodeCode(nodeCode)
+                .orElseThrow(() -> new IllegalArgumentException("节点不存在: " + nodeCode));
+
+        if (node.getStatus() != 1) {
+            throw new IllegalStateException("节点不可用");
         }
 
-        return bestNode;
+        if (!trafficMonitorClient.isNodeAvailable(nodeCode)) {
+            throw new IllegalStateException("节点今日流量已超限");
+        }
+
+        if (!nodeConcurrencyManager.canAcceptTask(nodeCode)) {
+            return null;
+        }
+
+        ReentrantLock nodeLock = nodeConcurrencyManager.getNodeLock(nodeCode);
+        if (!nodeLock.tryLock()) {
+            return null;
+        }
+
+        try {
+            if (!nodeConcurrencyManager.canAcceptTask(nodeCode)) {
+                return null;
+            }
+
+            TaskDispatchQueue.QueuedTask queuedTask = taskQueue.poll();
+            if (queuedTask == null) {
+                return null;
+            }
+
+            try {
+                return dispatchTask(queuedTask.getTaskCode(), nodeCode);
+            } catch (Exception e) {
+                log.warn("节点 [{}] 拉取任务 [{}] 失败: {}", nodeCode, queuedTask.getTaskCode(), e.getMessage());
+                taskQueue.incrementFailed();
+                return null;
+            }
+        } finally {
+            nodeLock.unlock();
+        }
     }
 
     @Transactional
@@ -123,7 +204,7 @@ public class TaskDispatchService {
         CrawlTask task = taskRepository.findByTaskCode(taskCode)
                 .orElseThrow(() -> new IllegalArgumentException("任务不存在: " + taskCode));
 
-        task.setStatus(status);
+        Integer currentStatus = task.getStatus();
 
         if (status.equals(CrawlTask.TaskStatus.RUNNING.getCode())) {
             task.setStartTime(LocalDateTime.now());
@@ -134,8 +215,12 @@ public class TaskDispatchService {
                 task.setActualSizeKb(actualSizeKb);
                 trafficMonitorClient.recordTraffic(task.getAssignedNodeCode(), actualSizeKb);
             }
+            if (task.getAssignedNodeCode() != null) {
+                nodeConcurrencyManager.decrementTaskCount(task.getAssignedNodeCode());
+            }
         }
 
+        task.setStatus(status);
         return taskRepository.save(task);
     }
 
@@ -155,7 +240,9 @@ public class TaskDispatchService {
         task.setStartTime(null);
         task.setFinishTime(null);
 
-        taskRepository.save(task);
+        CrawlTask saved = taskRepository.save(task);
+        taskQueue.offer(saved);
+
         log.info("任务 [{}] 准备第 {} 次重试", taskCode, task.getRetryCount());
         return true;
     }
@@ -173,7 +260,14 @@ public class TaskDispatchService {
 
         task.setStatus(CrawlTask.TaskStatus.CANCELLED.getCode());
         task.setFinishTime(LocalDateTime.now());
+
+        if (task.getAssignedNodeCode() != null) {
+            nodeConcurrencyManager.decrementTaskCount(task.getAssignedNodeCode());
+        }
+
         taskRepository.save(task);
+        taskQueue.remove(taskCode);
+
         log.info("任务 [{}] 已取消", taskCode);
     }
 
@@ -191,17 +285,60 @@ public class TaskDispatchService {
         return taskRepository.countByAssignedNodeCodeAndStatus(nodeCode, null);
     }
 
-    @Transactional
-    public void batchDispatch(int batchSize) {
-        Pageable pageable = PageRequest.of(0, batchSize);
-        List<CrawlTask> pendingTasks = taskRepository.findPendingTasksOrderByPriority(pageable);
+    public int getQueueSize() {
+        return taskQueue.size();
+    }
 
-        for (CrawlTask task : pendingTasks) {
+    public int getNodeRunningCount(String nodeCode) {
+        return nodeConcurrencyManager.getRunningTaskCount(nodeCode);
+    }
+
+    @Transactional
+    public int batchDispatch(int batchSize) {
+        int dispatched = 0;
+
+        List<CrawlerNode> availableNodes = nodeRepository.findByStatus(1);
+        if (availableNodes.isEmpty()) {
+            return 0;
+        }
+
+        for (int i = 0; i < batchSize; i++) {
+            CrawlerNode bestNode = selectBestNode(availableNodes);
+            if (bestNode == null) {
+                break;
+            }
+
+            TaskDispatchQueue.QueuedTask queuedTask = taskQueue.poll();
+            if (queuedTask == null) {
+                break;
+            }
+
             try {
-                autoDispatch(task.getTaskCode());
+                dispatchTask(queuedTask.getTaskCode(), bestNode.getNodeCode());
+                dispatched++;
             } catch (Exception e) {
-                log.warn("自动分发任务 [{}] 失败: {}", task.getTaskCode(), e.getMessage());
+                log.warn("批量分发任务 [{}] 失败: {}", queuedTask.getTaskCode(), e.getMessage());
+                taskQueue.incrementFailed();
             }
         }
+
+        log.info("批量分发完成，成功 {} 个", dispatched);
+        return dispatched;
+    }
+
+    @Transactional
+    public int loadPendingTasksToQueue(int limit) {
+        Pageable pageable = PageRequest.of(0, limit);
+        List<CrawlTask> pendingTasks = taskRepository.findPendingTasksOrderByPriority(pageable);
+
+        int loaded = 0;
+        for (CrawlTask task : pendingTasks) {
+            if (taskQueue.offer(task)) {
+                loaded++;
+            }
+        }
+
+        log.info("从数据库加载 {} 个待分发任务到队列", loaded);
+        return loaded;
     }
 }

@@ -1,9 +1,7 @@
 package com.cy3.common.dto;
 
-import lombok.Data;
 import java.time.LocalDateTime;
 
-@Data
 public class Result<T> {
 
     private Integer code;
@@ -13,6 +11,38 @@ public class Result<T> {
 
     private Result() {
         this.timestamp = LocalDateTime.now();
+    }
+
+    public Integer getCode() {
+        return code;
+    }
+
+    public void setCode(Integer code) {
+        this.code = code;
+    }
+
+    public String getMessage() {
+        return message;
+    }
+
+    public void setMessage(String message) {
+        this.message = message;
+    }
+
+    public T getData() {
+        return data;
+    }
+
+    public void setData(T data) {
+        this.data = data;
+    }
+
+    public LocalDateTime getTimestamp() {
+        return timestamp;
+    }
+
+    public void setTimestamp(LocalDateTime timestamp) {
+        this.timestamp = timestamp;
     }
 
     public static <T> Result<T> success() {

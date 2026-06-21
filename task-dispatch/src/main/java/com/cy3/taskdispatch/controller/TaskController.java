@@ -3,7 +3,6 @@ package com.cy3.taskdispatch.controller;
 import com.cy3.common.dto.Result;
 import com.cy3.common.entity.CrawlTask;
 import com.cy3.taskdispatch.service.TaskDispatchService;
-import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.web.bind.annotation.*;
 
@@ -11,10 +10,13 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/tasks")
-@RequiredArgsConstructor
 public class TaskController {
 
     private final TaskDispatchService taskDispatchService;
+
+    public TaskController(TaskDispatchService taskDispatchService) {
+        this.taskDispatchService = taskDispatchService;
+    }
 
     @PostMapping
     public Result<CrawlTask> createTask(@RequestBody Map<String, Object> request) {
@@ -126,5 +128,36 @@ public class TaskController {
     public Result<Long> getTaskCount(@RequestParam(required = false) Integer status) {
         long count = taskDispatchService.getTaskCount(status);
         return Result.success(count);
+    }
+
+    @PostMapping("/pull")
+    public Result<CrawlTask> pullTask(@RequestParam String nodeCode) {
+        try {
+            CrawlTask task = taskDispatchService.pullTask(nodeCode);
+            if (task == null) {
+                return Result.success(null);
+            }
+            return Result.success(task);
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            return Result.fail(e.getMessage());
+        }
+    }
+
+    @GetMapping("/queue/size")
+    public Result<Integer> getQueueSize() {
+        int size = taskDispatchService.getQueueSize();
+        return Result.success(size);
+    }
+
+    @GetMapping("/node/{nodeCode}/running-count")
+    public Result<Integer> getNodeRunningCount(@PathVariable String nodeCode) {
+        int count = taskDispatchService.getNodeRunningCount(nodeCode);
+        return Result.success(count);
+    }
+
+    @PostMapping("/queue/load")
+    public Result<Integer> loadPendingTasksToQueue(@RequestParam(defaultValue = "1000") int limit) {
+        int loaded = taskDispatchService.loadPendingTasksToQueue(limit);
+        return Result.success(loaded);
     }
 }

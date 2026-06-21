@@ -4,26 +4,39 @@ import com.cy3.common.entity.CrawlerNode;
 import com.cy3.common.entity.TrafficRecord;
 import com.cy3.trafficmonitor.repository.CrawlerNodeRepository;
 import com.cy3.trafficmonitor.repository.TrafficRecordRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
-@Slf4j
 @Service
-@RequiredArgsConstructor
 public class TrafficMonitorService {
+
+    private static final Logger log = LoggerFactory.getLogger(TrafficMonitorService.class);
 
     private final TrafficRecordRepository trafficRecordRepository;
     private final CrawlerNodeRepository crawlerNodeRepository;
 
+    private final ConcurrentHashMap<String, ReentrantLock> nodeLocks = new ConcurrentHashMap<>();
+
+    public TrafficMonitorService(TrafficRecordRepository trafficRecordRepository,
+                                 CrawlerNodeRepository crawlerNodeRepository) {
+        this.trafficRecordRepository = trafficRecordRepository;
+        this.crawlerNodeRepository = crawlerNodeRepository;
+    }
+
     @Value("${traffic.warning-threshold:0.9}")
     private double warningThreshold;
+
+    private static final int MAX_RETRY = 3;
 
     public long getTodayUsedTraffic(String nodeCode) {
         LocalDate today = LocalDate.now();
@@ -64,45 +77,89 @@ public class TrafficMonitorService {
             throw new IllegalArgumentException("流量大小必须大于0");
         }
 
-        LocalDate today = LocalDate.now();
-        TrafficRecord record = trafficRecordRepository.findByNodeCodeAndRecordDate(nodeCode, today)
-                .orElseGet(() -> createNewRecord(nodeCode, today));
-
         long sizeMb = (long) Math.ceil(sizeKb / 1024.0);
-        record.setUsedTrafficMb(record.getUsedTrafficMb() + sizeMb);
-        record.setRequestCount(record.getRequestCount() + 1);
+        LocalDate today = LocalDate.now();
 
-        CrawlerNode node = crawlerNodeRepository.findByNodeCode(nodeCode).orElse(null);
-        if (node != null) {
-            long limit = node.getDailyTrafficLimitMb();
-            boolean wasOverLimit = Boolean.TRUE.equals(record.getOverLimit());
-            boolean isOverLimit = record.getUsedTrafficMb() >= limit;
+        ensureRecordExists(nodeCode, today);
 
-            if (!wasOverLimit && isOverLimit) {
-                record.setOverLimit(true);
-                log.warn("节点 [{}] 今日流量已超限！已用: {}MB, 限额: {}MB",
-                        nodeCode, record.getUsedTrafficMb(), limit);
-            }
+        int updatedRows = trafficRecordRepository.incrementTrafficAtomically(
+                nodeCode, today, sizeMb, LocalDateTime.now());
+
+        if (updatedRows == 0) {
+            throw new IllegalStateException("流量记录更新失败");
         }
 
-        return trafficRecordRepository.save(record);
+        TrafficRecord record = trafficRecordRepository.findByNodeCodeAndRecordDate(nodeCode, today)
+                .orElseThrow(() -> new IllegalStateException("流量记录不存在"));
+
+        checkAndMarkOverLimit(nodeCode, record);
+
+        return record;
     }
 
-    private TrafficRecord createNewRecord(String nodeCode, LocalDate date) {
-        TrafficRecord record = new TrafficRecord();
-        record.setNodeCode(nodeCode);
-        record.setRecordDate(date);
-        record.setUsedTrafficMb(0L);
-        record.setRequestCount(0L);
-        record.setOverLimit(false);
-        return record;
+    private void ensureRecordExists(String nodeCode, LocalDate date) {
+        if (trafficRecordRepository.existsByNodeCodeAndRecordDate(nodeCode, date)) {
+            return;
+        }
+
+        ReentrantLock lock = nodeLocks.computeIfAbsent(nodeCode, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            if (trafficRecordRepository.existsByNodeCodeAndRecordDate(nodeCode, date)) {
+                return;
+            }
+            try {
+                TrafficRecord record = new TrafficRecord();
+                record.setNodeCode(nodeCode);
+                record.setRecordDate(date);
+                record.setUsedTrafficMb(0L);
+                record.setRequestCount(0L);
+                record.setOverLimit(false);
+                trafficRecordRepository.save(record);
+                log.debug("为节点 [{}] 创建新的日流量记录，日期: {}", nodeCode, date);
+            } catch (DataIntegrityViolationException e) {
+                log.debug("节点 [{}] 的日流量记录已由其他线程创建", nodeCode);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void checkAndMarkOverLimit(String nodeCode, TrafficRecord record) {
+        CrawlerNode node = crawlerNodeRepository.findByNodeCode(nodeCode).orElse(null);
+        if (node == null) {
+            return;
+        }
+
+        long limit = node.getDailyTrafficLimitMb();
+        if (limit <= 0) {
+            return;
+        }
+
+        boolean wasOverLimit = Boolean.TRUE.equals(record.getOverLimit());
+        boolean isOverLimit = record.getUsedTrafficMb() >= limit;
+
+        if (!wasOverLimit && isOverLimit) {
+            record.setOverLimit(true);
+            trafficRecordRepository.save(record);
+            log.warn("节点 [{}] 今日流量已超限！已用: {}MB, 限额: {}MB",
+                    nodeCode, record.getUsedTrafficMb(), limit);
+        }
     }
 
     @Transactional
     public TrafficRecord resetDailyRecord(String nodeCode, long usedTrafficMb, long requestCount) {
         LocalDate today = LocalDate.now();
         TrafficRecord record = trafficRecordRepository.findByNodeCodeAndRecordDate(nodeCode, today)
-                .orElseGet(() -> createNewRecord(nodeCode, today));
+                .orElseGet(() -> {
+                    TrafficRecord r = new TrafficRecord();
+                    r.setNodeCode(nodeCode);
+                    r.setRecordDate(today);
+                    r.setUsedTrafficMb(0L);
+                    r.setRequestCount(0L);
+                    r.setOverLimit(false);
+                    return r;
+                });
 
         record.setUsedTrafficMb(usedTrafficMb);
         record.setRequestCount(requestCount);

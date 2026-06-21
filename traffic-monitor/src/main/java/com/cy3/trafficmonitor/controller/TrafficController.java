@@ -3,7 +3,6 @@ package com.cy3.trafficmonitor.controller;
 import com.cy3.common.dto.Result;
 import com.cy3.common.entity.TrafficRecord;
 import com.cy3.trafficmonitor.service.TrafficMonitorService;
-import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -11,10 +10,13 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/traffic")
-@RequiredArgsConstructor
 public class TrafficController {
 
     private final TrafficMonitorService trafficMonitorService;
+
+    public TrafficController(TrafficMonitorService trafficMonitorService) {
+        this.trafficMonitorService = trafficMonitorService;
+    }
 
     @PostMapping("/record")
     public Result<TrafficRecord> recordTraffic(

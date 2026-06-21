@@ -3,7 +3,6 @@ package com.cy3.trafficmonitor.controller;
 import com.cy3.common.dto.Result;
 import com.cy3.common.entity.CrawlerNode;
 import com.cy3.trafficmonitor.service.NodeManagementService;
-import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -11,10 +10,13 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/nodes")
-@RequiredArgsConstructor
 public class NodeController {
 
     private final NodeManagementService nodeManagementService;
+
+    public NodeController(NodeManagementService nodeManagementService) {
+        this.nodeManagementService = nodeManagementService;
+    }
 
     @PostMapping
     public Result<CrawlerNode> registerNode(@RequestBody Map<String, Object> request) {

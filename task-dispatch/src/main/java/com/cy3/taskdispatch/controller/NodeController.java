@@ -3,7 +3,6 @@ package com.cy3.taskdispatch.controller;
 import com.cy3.common.dto.Result;
 import com.cy3.common.entity.CrawlerNode;
 import com.cy3.taskdispatch.service.NodeService;
-import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -11,10 +10,13 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/nodes")
-@RequiredArgsConstructor
 public class NodeController {
 
     private final NodeService nodeService;
+
+    public NodeController(NodeService nodeService) {
+        this.nodeService = nodeService;
+    }
 
     @PostMapping
     public Result<CrawlerNode> addNode(@RequestBody Map<String, Object> request) {
