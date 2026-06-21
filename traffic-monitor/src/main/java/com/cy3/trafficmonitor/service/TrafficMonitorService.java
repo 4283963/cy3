@@ -1,6 +1,7 @@
 package com.cy3.trafficmonitor.service;
 
 import com.cy3.common.entity.CrawlerNode;
+import com.cy3.common.entity.CrawlerNode.NodeStatus;
 import com.cy3.common.entity.TrafficRecord;
 import com.cy3.trafficmonitor.repository.CrawlerNodeRepository;
 import com.cy3.trafficmonitor.repository.TrafficRecordRepository;
@@ -59,7 +60,7 @@ public class TrafficMonitorService {
 
     public boolean isNodeAvailable(String nodeCode) {
         CrawlerNode node = crawlerNodeRepository.findByNodeCode(nodeCode).orElse(null);
-        if (node == null || node.getStatus() != 1) {
+        if (node == null || !node.getStatus().equals(NodeStatus.RUNNING.getCode())) {
             return false;
         }
 
@@ -144,6 +145,7 @@ public class TrafficMonitorService {
             trafficRecordRepository.save(record);
             log.warn("节点 [{}] 今日流量已超限！已用: {}MB, 限额: {}MB",
                     nodeCode, record.getUsedTrafficMb(), limit);
+            restNodeOverLimit(nodeCode);
         }
     }
 
@@ -202,15 +204,34 @@ public class TrafficMonitorService {
             throw new IllegalArgumentException("节点不存在: " + nodeCode);
         }
 
-        if (node.getStatus() == 0) {
+        if (node.getStatus().equals(NodeStatus.STOPPED.getCode())) {
             log.info("节点 [{}] 已处于停用状态", nodeCode);
             return true;
         }
 
-        node.setStatus(0);
+        node.setStatus(NodeStatus.STOPPED.getCode());
         crawlerNodeRepository.save(node);
 
-        log.warn("节点 [{}] 已被拉闸停用，原因: {}", nodeCode, reason);
+        log.warn("节点 [{}] 已被拉闸停用（状态：已停用），原因: {}", nodeCode, reason);
+        return true;
+    }
+
+    @Transactional
+    public boolean restNodeOverLimit(String nodeCode) {
+        CrawlerNode node = crawlerNodeRepository.findByNodeCode(nodeCode).orElse(null);
+        if (node == null) {
+            throw new IllegalArgumentException("节点不存在: " + nodeCode);
+        }
+
+        if (node.getStatus().equals(NodeStatus.RESTING.getCode())) {
+            log.info("节点 [{}] 已处于休息中状态", nodeCode);
+            return true;
+        }
+
+        node.setStatus(NodeStatus.RESTING.getCode());
+        crawlerNodeRepository.save(node);
+
+        log.warn("节点 [{}] 因流量超限进入休息中状态，等待复位", nodeCode);
         return true;
     }
 
@@ -221,20 +242,53 @@ public class TrafficMonitorService {
             throw new IllegalArgumentException("节点不存在: " + nodeCode);
         }
 
-        node.setStatus(1);
+        node.setStatus(NodeStatus.RUNNING.getCode());
         crawlerNodeRepository.save(node);
 
-        log.info("节点 [{}] 已恢复启用", nodeCode);
+        log.info("节点 [{}] 已恢复运行中状态", nodeCode);
         return true;
+    }
+
+    @Transactional
+    public CrawlerNode resetAndResumeNode(String nodeCode) {
+        CrawlerNode node = crawlerNodeRepository.findByNodeCode(nodeCode)
+                .orElseThrow(() -> new IllegalArgumentException("节点不存在: " + nodeCode));
+
+        if (!node.getStatus().equals(NodeStatus.RESTING.getCode())
+                && !node.getStatus().equals(NodeStatus.STOPPED.getCode())) {
+            log.info("节点 [{}] 当前状态为 {}，无需复位", nodeCode,
+                    NodeStatus.fromCode(node.getStatus()).getDesc());
+        }
+
+        LocalDate today = LocalDate.now();
+        TrafficRecord record = trafficRecordRepository.findByNodeCodeAndRecordDate(nodeCode, today)
+                .orElseGet(() -> {
+                    TrafficRecord r = new TrafficRecord();
+                    r.setNodeCode(nodeCode);
+                    r.setRecordDate(today);
+                    return r;
+                });
+
+        record.setUsedTrafficMb(0L);
+        record.setRequestCount(0L);
+        record.setOverLimit(false);
+        trafficRecordRepository.save(record);
+
+        node.setStatus(NodeStatus.RUNNING.getCode());
+        CrawlerNode saved = crawlerNodeRepository.save(node);
+
+        log.info("节点 [{}] 已复位：流量计数清零，状态恢复为运行中", nodeCode);
+        return saved;
     }
 
     @Transactional
     public void checkAndShutOffOverLimitNodes() {
         List<TrafficRecord> overLimitRecords = getTodayOverLimitRecords();
         for (TrafficRecord record : overLimitRecords) {
-            CrawlerNode node = crawlerNodeRepository.findByNodeCode(record.getNodeCode()).orElse(null);
-            if (node != null && node.getStatus() == 1) {
-                shutOffNode(record.getNodeCode(), "今日流量已超限");
+            String nodeCode = record.getNodeCode();
+            CrawlerNode node = crawlerNodeRepository.findByNodeCode(nodeCode).orElse(null);
+            if (node != null && node.getStatus().equals(NodeStatus.RUNNING.getCode())) {
+                restNodeOverLimit(nodeCode);
             }
         }
     }
@@ -251,5 +305,9 @@ public class TrafficMonitorService {
 
         node.setDailyTrafficLimitMb(dailyLimitMb);
         return crawlerNodeRepository.save(node);
+    }
+
+    public List<CrawlerNode> getRestingNodes() {
+        return crawlerNodeRepository.findByStatus(NodeStatus.RESTING.getCode());
     }
 }

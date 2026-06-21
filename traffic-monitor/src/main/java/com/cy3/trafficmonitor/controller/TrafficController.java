@@ -124,4 +124,20 @@ public class TrafficController {
             return Result.fail(e.getMessage());
         }
     }
+
+    @PostMapping("/reset-resume")
+    public Result<?> resetAndResumeNode(@RequestParam String nodeCode) {
+        try {
+            var node = trafficMonitorService.resetAndResumeNode(nodeCode);
+            return Result.success(node);
+        } catch (IllegalArgumentException e) {
+            return Result.fail(e.getMessage());
+        }
+    }
+
+    @GetMapping("/resting-nodes")
+    public Result<List<?>> getRestingNodes() {
+        var nodes = trafficMonitorService.getRestingNodes();
+        return Result.success(nodes);
+    }
 }

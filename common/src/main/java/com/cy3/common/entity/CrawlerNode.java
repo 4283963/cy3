@@ -47,6 +47,37 @@ public class CrawlerNode {
         updateTime = LocalDateTime.now();
     }
 
+    public enum NodeStatus {
+        STOPPED(0, "已停用"),
+        RUNNING(1, "运行中"),
+        RESTING(2, "休息中（流量超限）");
+
+        private final int code;
+        private final String desc;
+
+        NodeStatus(int code, String desc) {
+            this.code = code;
+            this.desc = desc;
+        }
+
+        public int getCode() {
+            return code;
+        }
+
+        public String getDesc() {
+            return desc;
+        }
+
+        public static NodeStatus fromCode(int code) {
+            for (NodeStatus s : values()) {
+                if (s.code == code) {
+                    return s;
+                }
+            }
+            return STOPPED;
+        }
+    }
+
     public Long getId() {
         return id;
     }

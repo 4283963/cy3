@@ -2,6 +2,7 @@ package com.cy3.taskdispatch.service;
 
 import com.cy3.common.entity.CrawlTask;
 import com.cy3.common.entity.CrawlerNode;
+import com.cy3.common.entity.CrawlerNode.NodeStatus;
 import com.cy3.taskdispatch.queue.NodeConcurrencyManager;
 import com.cy3.taskdispatch.queue.TaskDispatchQueue;
 import com.cy3.taskdispatch.repository.CrawlTaskRepository;
@@ -82,7 +83,7 @@ public class TaskDispatchService {
         CrawlerNode node = nodeRepository.findByNodeCode(nodeCode)
                 .orElseThrow(() -> new IllegalArgumentException("节点不存在: " + nodeCode));
 
-        if (node.getStatus() != 1) {
+        if (node.getStatus() != NodeStatus.RUNNING.getCode()) {
             throw new IllegalStateException("节点不可用，当前状态: " + node.getStatus());
         }
 
@@ -118,7 +119,7 @@ public class TaskDispatchService {
 
     @Transactional
     public CrawlTask autoDispatch(String taskCode) {
-        List<CrawlerNode> availableNodes = nodeRepository.findByStatus(1);
+        List<CrawlerNode> availableNodes = nodeRepository.findByStatus(NodeStatus.RUNNING.getCode());
         if (availableNodes.isEmpty()) {
             throw new IllegalStateException("没有可用的爬虫节点");
         }
@@ -297,7 +298,7 @@ public class TaskDispatchService {
     public int batchDispatch(int batchSize) {
         int dispatched = 0;
 
-        List<CrawlerNode> availableNodes = nodeRepository.findByStatus(1);
+        List<CrawlerNode> availableNodes = nodeRepository.findByStatus(NodeStatus.RUNNING.getCode());
         if (availableNodes.isEmpty()) {
             return 0;
         }

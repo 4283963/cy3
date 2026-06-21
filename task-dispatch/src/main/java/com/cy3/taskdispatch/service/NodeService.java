@@ -1,6 +1,7 @@
 package com.cy3.taskdispatch.service;
 
 import com.cy3.common.entity.CrawlerNode;
+import com.cy3.common.entity.CrawlerNode.NodeStatus;
 import com.cy3.taskdispatch.repository.CrawlerNodeRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +29,7 @@ public class NodeService {
         node.setNodeCode(nodeCode);
         node.setNodeName(nodeName);
         node.setIpAddress(ipAddress);
-        node.setStatus(1);
+        node.setStatus(NodeStatus.RUNNING.getCode());
         node.setDailyTrafficLimitMb(dailyTrafficLimitMb != null ? dailyTrafficLimitMb : 10240L);
 
         log.info("新增节点: {}", nodeCode);
@@ -44,7 +45,7 @@ public class NodeService {
     }
 
     public List<CrawlerNode> getAvailableNodes() {
-        return nodeRepository.findByStatus(1);
+        return nodeRepository.findByStatus(NodeStatus.RUNNING.getCode());
     }
 
     @Transactional
